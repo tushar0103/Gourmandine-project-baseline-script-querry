@@ -1,0 +1,758 @@
+CREATE OR REPLACE PROCEDURE MAKESS.PRC_UPLOAD_ARTICLES
+IS
+    ------------------------------------------------------------------
+    -- COMPANY CURSOR
+    ------------------------------------------------------------------
+    CURSOR comp_code IS
+        SELECT vc_comp_code
+          FROM mst_company
+         WHERE vc_comp_code IN ('0O', '0P', '0Q')
+         ORDER BY vc_comp_code;
+
+    ------------------------------------------------------------------
+    -- ITEM UPLOAD CURSOR
+    ------------------------------------------------------------------
+    CURSOR item IS
+        SELECT CLASS,
+               ITEM_GROUP,
+               SUB_GROUP,
+               VC_ITEM_DESC
+          FROM MAKESS.ITEM_UPLOAD;
+
+    ------------------------------------------------------------------
+    -- WAREHOUSE CURSOR
+    ------------------------------------------------------------------
+    CURSOR wh_code(p_comp_code VARCHAR2) IS
+        SELECT '01' AS wh_code
+          FROM dual
+         WHERE p_comp_code IN ('0O', '0P')
+        UNION ALL
+        SELECT '02' AS wh_code
+          FROM dual
+         WHERE p_comp_code = '0P';
+
+    ------------------------------------------------------------------
+    -- VARIABLES
+    ------------------------------------------------------------------
+    class_code         VARCHAR2(100);
+    grp_code           VARCHAR2(100);
+    sub_group_code     VARCHAR2(100);
+
+    class_prefix       VARCHAR2(20);
+    grp_prefix         VARCHAR2(20);
+    sgrp_prefix        VARCHAR2(20);
+
+    new_code           VARCHAR2(30);
+    code_suffix        VARCHAR2(10);
+
+    barcode_now        VARCHAR2(13);
+    barcode_num        NUMBER;
+
+    cnt_item_name      NUMBER := 0;
+    cnt_item           NUMBER := 0;
+    cnt_barcode        NUMBER := 0;
+
+    cnt_dist_codes     NUMBER := 0;
+    cnt_dist_barcodes  NUMBER := 0;
+
+    existing_code      VARCHAR2(30);
+    existing_barcode   VARCHAR2(100);
+
+    v_count            NUMBER;
+    v_group_code       VARCHAR2(100);
+
+    fin_start_date     DATE := DATE '2026-01-01';
+    fin_end_date       DATE := DATE '2026-12-31';
+
+    user_code          VARCHAR2(20) := '01';
+    default_comp       VARCHAR2(2) := '0O';
+
+BEGIN
+
+    ------------------------------------------------------------------
+    -- STEP 1: VALIDATE UPLOAD DATA BEFORE PROCESSING ANY ARTICLE
+    -- All masters must exist in companies 0O, 0P and 0Q.
+    ------------------------------------------------------------------
+
+    FOR c IN comp_code LOOP
+
+        --------------------------------------------------------------
+        -- VALIDATE CLASSIFICATION MASTER
+        --------------------------------------------------------------
+        FOR r IN (
+            SELECT DISTINCT UPPER(TRIM(CLASS)) AS CLASS_NAME
+              FROM MAKESS.ITEM_UPLOAD
+             WHERE CLASS IS NOT NULL
+        )
+        LOOP
+            SELECT COUNT(*)
+              INTO v_count
+              FROM INVENT.MST_REASON
+             WHERE VC_COMP_CODE = c.VC_COMP_CODE
+               AND VC_REASON_FLG = 'C'
+               AND UPPER(TRIM(VC_REASON_DESC)) = r.CLASS_NAME;
+
+            IF v_count = 0 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20005,
+                    'Classification not found in company '
+                    || c.VC_COMP_CODE || ': ' || r.CLASS_NAME
+                );
+            ELSIF v_count > 1 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20006,
+                    'Duplicate classification in company '
+                    || c.VC_COMP_CODE || ': ' || r.CLASS_NAME
+                );
+            END IF;
+        END LOOP;
+
+        --------------------------------------------------------------
+        -- VALIDATE ITEM GROUP MASTER
+        --------------------------------------------------------------
+        FOR r IN (
+            SELECT DISTINCT UPPER(TRIM(ITEM_GROUP)) AS GROUP_NAME
+              FROM MAKESS.ITEM_UPLOAD
+             WHERE ITEM_GROUP IS NOT NULL
+        )
+        LOOP
+            SELECT COUNT(*)
+              INTO v_count
+              FROM INVENT.MST_GROUP
+             WHERE VC_COMP_CODE = c.VC_COMP_CODE
+               AND UPPER(TRIM(VC_GROUP_DESC)) = r.GROUP_NAME;
+
+            IF v_count = 0 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20007,
+                    'Item group not found in company '
+                    || c.VC_COMP_CODE || ': ' || r.GROUP_NAME
+                );
+            ELSIF v_count > 1 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20008,
+                    'Duplicate item group in company '
+                    || c.VC_COMP_CODE || ': ' || r.GROUP_NAME
+                );
+            END IF;
+        END LOOP;
+
+        --------------------------------------------------------------
+        -- VALIDATE SUBGROUP MASTER
+        -- Match subgroup DESCRIPTION, not subgroup CODE.
+        -- Also verify that the subgroup belongs to the uploaded group.
+        --------------------------------------------------------------
+        FOR r IN (
+            SELECT DISTINCT
+                   UPPER(TRIM(ITEM_GROUP)) AS GROUP_NAME,
+                   UPPER(TRIM(SUB_GROUP)) AS SUBGROUP_NAME
+              FROM MAKESS.ITEM_UPLOAD
+             WHERE ITEM_GROUP IS NOT NULL
+               AND SUB_GROUP IS NOT NULL
+        )
+        LOOP
+            BEGIN
+                SELECT VC_GROUP_CODE
+                  INTO v_group_code
+                  FROM INVENT.MST_GROUP
+                 WHERE VC_COMP_CODE = c.VC_COMP_CODE
+                   AND UPPER(TRIM(VC_GROUP_DESC)) = r.GROUP_NAME;
+
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20007,
+                        'Item group not found in company '
+                        || c.VC_COMP_CODE || ': ' || r.GROUP_NAME
+                    );
+
+                WHEN TOO_MANY_ROWS THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20008,
+                        'Duplicate item group in company '
+                        || c.VC_COMP_CODE || ': ' || r.GROUP_NAME
+                    );
+            END;
+
+            SELECT COUNT(*)
+              INTO v_count
+              FROM INVENT.MST_SUB_GROUP
+             WHERE VC_COMP_CODE = c.VC_COMP_CODE
+               AND UPPER(TRIM(VC_SUB_GROUP_DESC)) = r.SUBGROUP_NAME
+               AND VC_GROUP_CODE = v_group_code;
+
+            IF v_count = 0 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20009,
+                    'Subgroup not found or does not belong to group '
+                    || r.GROUP_NAME || ' in company '
+                    || c.VC_COMP_CODE || ': ' || r.SUBGROUP_NAME
+                );
+            ELSIF v_count > 1 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20010,
+                    'Duplicate subgroup in company '
+                    || c.VC_COMP_CODE || ': ' || r.SUBGROUP_NAME
+                );
+            END IF;
+        END LOOP;
+
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- STEP 2: PROCESS EACH UPLOADED ARTICLE
+    ------------------------------------------------------------------
+    FOR j IN item LOOP
+
+        IF TRIM(j.VC_ITEM_DESC) IS NULL
+           OR TRIM(j.CLASS) IS NULL
+           OR TRIM(j.ITEM_GROUP) IS NULL
+           OR TRIM(j.SUB_GROUP) IS NULL
+        THEN
+            RAISE_APPLICATION_ERROR(
+                -20001,
+                'Article description, class, group and subgroup '
+                || 'must not be empty.'
+            );
+        END IF;
+
+        --------------------------------------------------------------
+        -- CHECK WHETHER ARTICLE ALREADY EXISTS IN ANY COMPANY
+        --------------------------------------------------------------
+        SELECT COUNT(DISTINCT VC_ITEM_CODE),
+               MIN(VC_ITEM_CODE),
+               COUNT(DISTINCT VC_SUP_ITEM_CODE),
+               MIN(VC_SUP_ITEM_CODE)
+          INTO cnt_dist_codes,
+               existing_code,
+               cnt_dist_barcodes,
+               existing_barcode
+          FROM MAKESS.MST_ITEM
+         WHERE VC_COMP_CODE IN ('0O', '0P', '0Q')
+           AND UPPER(TRIM(VC_ITEM_DESC)) =
+               UPPER(TRIM(j.VC_ITEM_DESC));
+
+        IF cnt_dist_codes > 1 THEN
+            RAISE_APPLICATION_ERROR(
+                -20002,
+                'The same description has different item codes: '
+                || j.VC_ITEM_DESC
+            );
+        END IF;
+
+        IF cnt_dist_barcodes > 1 THEN
+            RAISE_APPLICATION_ERROR(
+                -20003,
+                'The same description has different barcodes: '
+                || j.VC_ITEM_DESC
+            );
+        END IF;
+
+        --------------------------------------------------------------
+        -- REUSE EXISTING ITEM CODE AND BARCODE
+        --------------------------------------------------------------
+        IF cnt_dist_codes = 1 THEN
+
+            new_code := existing_code;
+
+            IF existing_barcode IS NULL THEN
+                RAISE_APPLICATION_ERROR(
+                    -20004,
+                    'Existing article has no barcode: '
+                    || j.VC_ITEM_DESC
+                );
+            END IF;
+
+            barcode_now := existing_barcode;
+
+        ELSE
+
+            ----------------------------------------------------------
+            -- GET CLASSIFICATION FROM REFERENCE COMPANY 0O
+            ----------------------------------------------------------
+            BEGIN
+                SELECT VC_REASON_CODE,
+                       NVL(VC_FIELD1, '00')
+                  INTO class_code,
+                       class_prefix
+                  FROM INVENT.MST_REASON
+                 WHERE VC_COMP_CODE = '0O'
+                   AND VC_REASON_FLG = 'C'
+                   AND UPPER(TRIM(VC_REASON_DESC)) =
+                       UPPER(TRIM(j.CLASS));
+
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20005,
+                        'Classification not found in company 0O: '
+                        || j.CLASS
+                    );
+
+                WHEN TOO_MANY_ROWS THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20006,
+                        'Multiple classifications found in company 0O: '
+                        || j.CLASS
+                    );
+            END;
+
+            ----------------------------------------------------------
+            -- GET ITEM GROUP FROM REFERENCE COMPANY 0O
+            ----------------------------------------------------------
+            BEGIN
+                SELECT VC_GROUP_CODE,
+                       NVL(VC_FIELD2, '00')
+                  INTO grp_code,
+                       grp_prefix
+                  FROM INVENT.MST_GROUP
+                 WHERE VC_COMP_CODE = '0O'
+                   AND UPPER(TRIM(VC_GROUP_DESC)) =
+                       UPPER(TRIM(j.ITEM_GROUP));
+
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20007,
+                        'Item group not found in company 0O: '
+                        || j.ITEM_GROUP
+                    );
+
+                WHEN TOO_MANY_ROWS THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20008,
+                        'Multiple item groups found in company 0O: '
+                        || j.ITEM_GROUP
+                    );
+            END;
+
+            ----------------------------------------------------------
+            -- GET SUBGROUP FROM REFERENCE COMPANY 0O
+            -- IMPORTANT: Match VC_SUB_GROUP_DESC.
+            ----------------------------------------------------------
+            BEGIN
+                SELECT VC_SUB_GROUP_CODE,
+                       NVL(VC_FIELD2, '00')
+                  INTO sub_group_code,
+                       sgrp_prefix
+                  FROM INVENT.MST_SUB_GROUP
+                 WHERE VC_COMP_CODE = '0O'
+                   AND VC_GROUP_CODE = grp_code
+                   AND UPPER(TRIM(VC_SUB_GROUP_DESC)) =
+                       UPPER(TRIM(j.SUB_GROUP));
+
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20009,
+                        'Subgroup not found in company 0O: '
+                        || j.SUB_GROUP
+                    );
+
+                WHEN TOO_MANY_ROWS THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20010,
+                        'Multiple subgroups found in company 0O: '
+                        || j.SUB_GROUP
+                    );
+            END;
+
+            ----------------------------------------------------------
+            -- GENERATE SHARED ITEM CODE
+            ----------------------------------------------------------
+            new_code :=
+                UPPER(class_prefix)
+                || UPPER(grp_prefix)
+                || UPPER(sgrp_prefix);
+
+            SELECT LPAD(
+                       TO_CHAR(
+                           NVL(
+                               MAX(
+                                   CASE
+                                       WHEN REGEXP_LIKE(
+                                           SUBSTR(
+                                               VC_ITEM_CODE,
+                                               LENGTH(new_code) + 1
+                                           ),
+                                           '^[0-9]+$'
+                                       )
+                                       THEN TO_NUMBER(
+                                           SUBSTR(
+                                               VC_ITEM_CODE,
+                                               LENGTH(new_code) + 1
+                                           )
+                                       )
+                                   END
+                               ),
+                               0
+                           ) + 1
+                       ),
+                       5,
+                       '0'
+                   )
+              INTO code_suffix
+              FROM MAKESS.MST_ITEM
+             WHERE VC_COMP_CODE IN ('0O', '0P', '0Q')
+               AND VC_ITEM_CODE LIKE new_code || '%'
+               AND LENGTH(VC_ITEM_CODE) <= 11;
+
+            new_code := new_code || code_suffix;
+
+            IF LENGTH(new_code) > 30 THEN
+                RAISE_APPLICATION_ERROR(
+                    -20011,
+                    'Generated item code exceeds column length: '
+                    || new_code
+                );
+            END IF;
+
+            ----------------------------------------------------------
+            -- GENERATE SHARED BARCODE
+            ----------------------------------------------------------
+            SELECT GREATEST(
+                       NVL(
+                           (
+                               SELECT MAX(TO_NUMBER(VC_ITEM_BARCODE))
+                                 FROM MAKESS.MST_ITEM_BARCODE
+                                WHERE LENGTH(VC_ITEM_BARCODE) = 13
+                                  AND REGEXP_LIKE(
+                                      VC_ITEM_BARCODE,
+                                      '^[0-9]{13}$'
+                                  )
+                           ),
+                           5000000000000
+                       ),
+                       NVL(
+                           (
+                               SELECT MAX(TO_NUMBER(VC_SUP_ITEM_CODE))
+                                 FROM MAKESS.MST_ITEM
+                                WHERE LENGTH(VC_SUP_ITEM_CODE) = 13
+                                  AND REGEXP_LIKE(
+                                      VC_SUP_ITEM_CODE,
+                                      '^[0-9]{13}$'
+                                  )
+                           ),
+                           5000000000000
+                       )
+                   ) + 1
+              INTO barcode_num
+              FROM dual;
+
+            LOOP
+                IF barcode_num > 9999999999999 THEN
+                    RAISE_APPLICATION_ERROR(
+                        -20012,
+                        '13-digit barcode range exhausted.'
+                    );
+                END IF;
+
+                barcode_now :=
+                    TO_CHAR(barcode_num, 'FM0000000000000');
+
+                SELECT
+                    (SELECT COUNT(*)
+                       FROM MAKESS.MST_ITEM_BARCODE
+                      WHERE VC_ITEM_BARCODE = barcode_now)
+                    +
+                    (SELECT COUNT(*)
+                       FROM MAKESS.MST_ITEM
+                      WHERE VC_SUP_ITEM_CODE = barcode_now)
+                  INTO cnt_barcode
+                  FROM dual;
+
+                EXIT WHEN cnt_barcode = 0;
+
+                barcode_num := barcode_num + 1;
+            END LOOP;
+
+        END IF;
+
+        --------------------------------------------------------------
+        -- STEP 3: PROCESS EACH COMPANY WITH SHARED ITEM CODE/BARCODE
+        --------------------------------------------------------------
+        FOR i IN comp_code LOOP
+
+            ----------------------------------------------------------
+            -- SKIP IF ITEM ALREADY EXISTS IN THIS COMPANY
+            ----------------------------------------------------------
+            SELECT COUNT(*)
+              INTO cnt_item
+              FROM MAKESS.MST_ITEM
+             WHERE VC_COMP_CODE = i.VC_COMP_CODE
+               AND (
+                    VC_ITEM_CODE = new_code
+                    OR UPPER(TRIM(VC_ITEM_DESC)) =
+                       UPPER(TRIM(j.VC_ITEM_DESC))
+                   );
+
+            IF cnt_item > 0 THEN
+                CONTINUE;
+            END IF;
+
+            ----------------------------------------------------------
+            -- FOR EXISTING SHARED ARTICLES, GET THEIR MASTER CODES
+            -- FROM REFERENCE COMPANY 0O.
+            ----------------------------------------------------------
+            IF cnt_dist_codes > 0 THEN
+                BEGIN
+                    SELECT VC_CLASSIFICATION,
+                           VC_ITEM_GROUP,
+                           VC_ITEM_SUB_GROUP
+                      INTO class_code,
+                           grp_code,
+                           sub_group_code
+                      FROM MAKESS.MST_ITEM
+                     WHERE VC_COMP_CODE = '0O'
+                       AND VC_ITEM_CODE = new_code;
+
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN
+                        RAISE_APPLICATION_ERROR(
+                            -20013,
+                            'Existing shared item is missing from '
+                            || 'reference company 0O: ' || new_code
+                        );
+
+                    WHEN TOO_MANY_ROWS THEN
+                        RAISE_APPLICATION_ERROR(
+                            -20014,
+                            'Duplicate item code in reference company 0O: '
+                            || new_code
+                        );
+                END;
+            END IF;
+
+            ----------------------------------------------------------
+            -- INSERT INTO MAKESS.MST_ITEM
+            ----------------------------------------------------------
+            INSERT INTO MAKESS.MST_ITEM
+            (
+                VC_DEFAULT_COMP, VC_COMP_CODE, VC_ITEM_CODE,
+                VC_ITEM_DESC, VC_TECH_DESC, NU_BASIC_PRICE,
+                NU_EVAL_RATE, VC_UNIT, VC_CLASSIFICATION, VC_MAT_CAT,
+                VC_NATURE, VC_IMPORT_FLG, VC_ITEM_GROUP, VC_UNIT_CODE,
+                VC_LOT_NO, VC_ITEM_SUB_GROUP, NU_CONV_FACTOR,
+                DT_MOD_DATE, VC_AUTH_CODE, VC_FIELD4, VC_SUP_ITEM_CODE,
+                NU_SELLING_PRICE, DT_EFFECT_DATE, NU_OPENING_VAL,
+                VC_VAT_CODE, CH_STATUS, NU_FOREIGN_PRICE, CH_GEN_ITEMS,
+                NU_PERCENTAGE, VC_CREATE_CODE, DT_CREATE_DATE,
+                NU_BASIC_PRICE_FC, DT_CREATED_DATE, VC_CREATED_BY,
+                NU_VAT_PERC, VC_PRINCIPAL_CODE, VC_BRAND_CODE,
+                DT_LAST_UPD, NU_WEIGHT
+            )
+            VALUES
+            (
+                default_comp, i.VC_COMP_CODE, new_code,
+                j.VC_ITEM_DESC, j.VC_ITEM_DESC, 1,
+                1, 'PIECE', class_code, 'Y',
+                'R', 'N', grp_code, '16',
+                '0', sub_group_code, 2400,
+                SYSDATE, user_code, 'N', barcode_now,
+                2, SYSDATE, 0,
+                '1', 'N', 4800, 'R',
+                100, user_code, SYSDATE,
+                2400, SYSDATE, user_code,
+                16, '15', '14',
+                SYSDATE, 0.24
+            );
+
+            ----------------------------------------------------------
+            -- INSERT INTO MAKESS.MST_ITEM_BARCODE
+            ----------------------------------------------------------
+            INSERT INTO MAKESS.MST_ITEM_BARCODE
+            (
+                VC_COMP_CODE, VC_DEFAULT_COMP, VC_ITEM_CODE,
+                VC_SUP_ITEM_CODE, VC_ITEM_BARCODE, VC_UNIT,
+                DT_MOD_DATE, VC_AUTH_CODE, VC_UNIT_CODE,
+                NU_UNIT_FACTOR, VC_CREATE_CODE, DT_CREATE_DATE,
+                DT_CREATED_DATE, NU_RATE, NU_CURR_CONV,
+                NU_FC_RATE, DT_LAST_UPD
+            )
+            VALUES
+            (
+                i.VC_COMP_CODE, default_comp, new_code,
+                barcode_now, barcode_now, 'PIECE',
+                SYSDATE, user_code, '16',
+                1, user_code, SYSDATE,
+                SYSDATE, 1, 2400,
+                2400, SYSDATE
+            );
+
+            ----------------------------------------------------------
+            -- INSERT INTO MAKESS.MST_ITEM_RATE_INFO
+            ----------------------------------------------------------
+            INSERT INTO MAKESS.MST_ITEM_RATE_INFO
+            (
+                VC_COMP_CODE, VC_ITEM_CODE, NU_RATE,
+                DT_EFFECT_FROM, VC_AUTH_CODE, VC_DEFAULT_COMP
+            )
+            VALUES
+            (
+                i.VC_COMP_CODE, new_code, 2,
+                SYSDATE, user_code, default_comp
+            );
+
+            ----------------------------------------------------------
+            -- INSERT INTO MAKESS.MST_EXCISE_PRODUCT
+            ----------------------------------------------------------
+            INSERT INTO MAKESS.MST_EXCISE_PRODUCT
+            (
+                VC_DEFAULT_COMP, VC_COMP_CODE, VC_PRODUCT_CODE,
+                CH_MRP_RULE, DT_MOD_DATE, VC_AUTH_CODE,
+                DT_CREATED_DATE, DT_LAST_UPD
+            )
+            VALUES
+            (
+                default_comp, i.VC_COMP_CODE, new_code,
+                'N', SYSDATE, user_code,
+                SYSDATE, SYSDATE
+            );
+
+            ----------------------------------------------------------
+            -- INSERT INTO INVENT.MST_MONTH_SUMMARY
+            ----------------------------------------------------------
+            INSERT INTO INVENT.MST_MONTH_SUMMARY
+            (
+                VC_COMP_CODE, VC_DEFAULT_COMP,
+                DT_FIN_START_DATE, DT_FIN_END_DATE, VC_ITEM_CODE,
+                NU_YEAR_OPEN_BALANCE,
+                NU_ISSUE_04, NU_RECEIPT_04,
+                NU_ISSUE_05, NU_RECEIPT_05,
+                NU_ISSUE_06, NU_RECEIPT_06,
+                NU_ISSUE_07, NU_RECEIPT_07,
+                NU_ISSUE_08, NU_RECEIPT_08,
+                NU_ISSUE_09, NU_RECEIPT_09,
+                NU_ISSUE_10, NU_RECEIPT_10,
+                NU_ISSUE_11, NU_RECEIPT_11,
+                NU_ISSUE_12, NU_RECEIPT_12,
+                NU_ISSUE_01, NU_RECEIPT_01,
+                NU_ISSUE_02, NU_RECEIPT_02,
+                NU_ISSUE_03, NU_RECEIPT_03,
+                NU_TOT_ISSUED, NU_TOT_RECEIVED,
+                CH_STAT_UP_FLAG, CH_STAT_FLAG,
+                DT_MOD_DATE, VC_AUTH_CODE,
+                VC_FIELD1, VC_FIELD2, VC_FIELD3, VC_FIELD4,
+                DT_FIELD1, DT_FIELD2, NU_FIELD1, NU_FIELD2,
+                DT_CREATED_DATE, VC_CREATED_BY
+            )
+            VALUES
+            (
+                i.VC_COMP_CODE, default_comp,
+                fin_start_date, fin_end_date, new_code,
+                0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
+                NULL, NULL,
+                SYSDATE, user_code,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                SYSDATE, user_code
+            );
+
+            ----------------------------------------------------------
+            -- WAREHOUSE RECORDS: 0O AND 0P ONLY
+            ----------------------------------------------------------
+            IF i.VC_COMP_CODE IN ('0O', '0P') THEN
+
+                FOR k IN wh_code(i.VC_COMP_CODE) LOOP
+
+                    INSERT INTO INVENT.MST_WH_SUMMARY
+                    (
+                        VC_COMP_CODE, VC_DEFAULT_COMP, VC_WH_CODE,
+                        DT_FIN_START_DATE, DT_FIN_END_DATE,
+                        VC_ITEM_CODE, NU_YEAR_OPEN_BALANCE,
+                        NU_OPENING_VALUE
+                    )
+                    VALUES
+                    (
+                        i.VC_COMP_CODE, default_comp, k.WH_CODE,
+                        fin_start_date, fin_end_date,
+                        new_code, 0, 0
+                    );
+
+                    INSERT INTO INVENT.DT_ITEM_LOCATION
+                    (
+                        VC_COMP_CODE, VC_LOC_CODE, VC_ITEM_CODE,
+                        DT_MOD_DATE, VC_AUTH_CODE, VC_DEFAULT_COMP,
+                        NU_ACCOUNT_CODE_SALES, NU_ACCOUNT_CODE_STK_EXP,
+                        NU_ACCOUNT_CODE_STK_HAND, DT_LAST_UPD
+                    )
+                    VALUES
+                    (
+                        i.VC_COMP_CODE, k.WH_CODE, new_code,
+                        SYSDATE, user_code, default_comp,
+                        7010001, 3200001, 6000001, SYSDATE
+                    );
+
+                    INSERT INTO INVENT.MST_PRICE_MASTER
+                    (
+                        VC_COMP_CODE, VC_PRICE_TYPE, VC_ITEM_CODE,
+                        NU_PRICE, NU_CURRENCY_CODE, VC_DEFAULT_COMP,
+                        VC_AUTH_CODE, DT_MOD_DATE, DT_EFFECTIVE_DATE,
+                        VC_BAR_CODE, NU_COST_PRICE, CH_PUSHED_TILL,
+                        VC_TIME, NU_PRICE_TVA, NU_PRICE_FC,
+                        VC_WAREHOUSE_CODE, DT_CREATED_DATE,
+                        NU_PRICE_FC_TVA, DT_LAST_UPD
+                    )
+                    VALUES
+                    (
+                        i.VC_COMP_CODE, 'R', new_code,
+                        2, 1, default_comp,
+                        user_code, SYSDATE, SYSDATE,
+                        barcode_now, 1, 'N',
+                        TO_CHAR(SYSDATE, 'HH24:MI:SS'),
+                        2.32, 4800,
+                        k.WH_CODE, SYSDATE,
+                        5568, SYSDATE
+                    );
+
+                END LOOP;
+            END IF;
+
+        END LOOP; -- COMPANY LOOP
+
+    END LOOP; -- ITEM LOOP
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+
+END PRC_UPLOAD_ARTICLES;
+/
+
+
+DROP TABLE MAKESS.ITEM_UPLOAD CASCADE CONSTRAINTS;
+
+CREATE TABLE MAKESS.ITEM_UPLOAD
+(
+  CLASS         VARCHAR2(50 BYTE),
+  ITEM_GROUP    VARCHAR2(50 BYTE),
+  SUB_GROUP     VARCHAR2(50 BYTE),
+  VC_ITEM_DESC  VARCHAR2(50 BYTE)
+)
+TABLESPACE MAKESS
+PCTUSED    0
+PCTFREE    10
+INITRANS   1
+MAXTRANS   255
+STORAGE    (
+            INITIAL          64K
+            NEXT             1M
+            MINEXTENTS       1
+            MAXEXTENTS       UNLIMITED
+            PCTINCREASE      0
+            BUFFER_POOL      DEFAULT
+           )
+LOGGING 
+NOCOMPRESS 
+NOCACHE
+MONITORING;
+
+
+GRANT ALTER, DELETE, INDEX, INSERT, REFERENCES, SELECT, UPDATE, ON COMMIT REFRESH, QUERY REWRITE, READ, DEBUG, FLASHBACK ON MAKESS.ITEM_UPLOAD TO PUBLIC;
